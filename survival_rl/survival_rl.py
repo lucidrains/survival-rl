@@ -41,23 +41,28 @@ class HazardCritic(Module):
         num_actions,
         pred_time_bins,
         dim_action = None,
-        dim_goal = None,
+        dim_event = None,
+        actor_event_kwarg = 'event',
         attn_residual = True,
         discount_factor = 0.99
     ):
         super().__init__()
 
+        self.actor_event_kwarg = actor_event_kwarg
+
         mlp_klass = AttnResidualNormedMLP if attn_residual else ResidualNormedMLP
 
-        dim_goal = default(dim_goal, dim_state)
+        dim_event = default(dim_event, dim_state)
         dim_action = default(dim_action, dim // 2)
 
         self.action_encoder = MLP(num_actions, dim_action, dim_action)
 
         mlp_kwargs = dict(
-            dim_in = dim_state + dim_goal + dim_action,
+            dim_in = dim_state + dim_action,
             dim = dim,
-            depth = depth
+            depth = depth,
+            film = True,
+            cond_dim = dim_event
         )
 
         if not attn_residual:
@@ -79,18 +84,22 @@ class HazardCritic(Module):
         self,
         actor: Module,
         state,
-        goal,
+        event,
+        negate = False
     ):
-        actions = actor(state, goal)
-        values = self.forward(state, actions, goal, return_values = True)
-        return -values
+        actions = actor(state, **{self.actor_event_kwarg: event})
+        values = self.forward(state, actions, event, return_values = True)
+
+        # negate for avoiding an adverse event
+
+        return -values if negate else values
 
     def forward(
         self,
         state,
         actions,
-        goal,
-        reach_goal_index = None, # -1 or >= horizon_cutoff treated as right-censored
+        event,
+        reach_event_index = None, # -1 or >= horizon_cutoff treated as right-censored
         horizon_cutoff = None,
         return_values = False
     ):
@@ -100,7 +109,7 @@ class HazardCritic(Module):
 
         encoded_action = self.action_encoder(actions)
 
-        embed = self.mlp((state, encoded_action, goal))
+        embed = self.mlp((state, encoded_action), cond = event)
 
         time_bin_logits = self.pred_time_bins(embed)
 
@@ -115,21 +124,21 @@ class HazardCritic(Module):
         if return_values:
             return -(log_survival + self.log_discounts).exp().sum(dim = -1)
 
-        # if no reach goal index given, return the log survival function
+        # if no reach event index given, return the log survival function
 
-        if not exists(reach_goal_index):
+        if not exists(reach_event_index):
             return log_survival
 
         # bce loss on logits
 
-        reached_goal = reach_goal_index < horizon_cutoff
-        reached_goal_bin = einx.equal('b, t -> b t', reach_goal_index, self.times) & reached_goal[..., None]
+        reached_event = reach_event_index < horizon_cutoff
+        reached_event_bin = einx.equal('b, t -> b t', reach_event_index, self.times) & reached_event[..., None]
 
-        losses = binary_cross_entropy_with_logits(time_bin_logits, reached_goal_bin.to(time_bin_logits.dtype), reduction = 'none')
+        losses = binary_cross_entropy_with_logits(time_bin_logits, reached_event_bin.to(time_bin_logits.dtype), reduction = 'none')
 
         # nll loss - time after cutoff is masked out
 
-        lens = torch.where(reach_goal_index >= 0, reach_goal_index + 1, horizon_cutoff).clamp(max = horizon_cutoff)
+        lens = torch.where(reach_event_index >= 0, reach_event_index + 1, horizon_cutoff).clamp(max = horizon_cutoff)
         mask = lens_to_mask(lens, self.num_time_bins)
 
         return masked_sum(losses, mask, dim = -1).mean()
