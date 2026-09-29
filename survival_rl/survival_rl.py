@@ -212,8 +212,8 @@ class HazardCritic(Module):
 
         # bce loss on logits
 
-        reached_event = reach_event_index < horizon_cutoff
-        reached_event_bin = einx.equal('b, t -> b t', reach_event_index, self.times) & reached_event[..., None]
+        reached_event = rearrange(reach_event_index < horizon_cutoff, 'b -> b 1')
+        reached_event_bin = einx.equal('b, t -> b t', reach_event_index, self.times) & reached_event
 
         losses = binary_cross_entropy_with_logits(time_bin_logits, reached_event_bin.to(time_bin_logits.dtype), reduction = 'none')
 
