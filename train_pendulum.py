@@ -4,6 +4,7 @@
 # dependencies = [
 #     "einx>=0.4.3",
 #     "einops>=0.8.2",
+#     "fire",
 #     "gymnasium",
 #     "mean-conc-beta",
 #     "memmap-replay-buffer",
@@ -28,7 +29,7 @@ from einops import rearrange
 
 from mean_conc_beta import Beta
 from memmap_replay_buffer import ReplayBuffer
-from survival_rl import HazardCritic, compute_first_dwell_time
+from survival_rl import HazardCritic, HazardCriticCompetitive, compute_first_dwell_time
 from x_mlps_pytorch import MLP
 
 # the goal is the full pendulum state, augmented with velocity and acceleration, so the base goal
@@ -112,7 +113,8 @@ def main(
     p_base = 0.35,
     p_future = 0.35,
     p_random = 0.15,
-    collect_base_prob = 0.5
+    collect_base_prob = 0.5,
+    competitive = False
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -121,7 +123,8 @@ def main(
     max_dwell = dwell_schedule[-1][1]
 
     actor = Actor().to(device)
-    critic = HazardCritic(
+    critic_klass = HazardCriticCompetitive if competitive else HazardCritic
+    critic = critic_klass(
         dim = 128,
         depth = 2,
         dim_state = 3,
@@ -289,4 +292,5 @@ def main(
     print(f'inverted pendulum balanced with survival RL (eval return: {score:.1f})')
 
 if __name__ == '__main__':
-    main()
+    import fire
+    fire.Fire(main)

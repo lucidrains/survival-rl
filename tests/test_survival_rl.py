@@ -5,7 +5,7 @@ import torch
 from torch.nn import Module
 
 from x_mlps_pytorch import MLP
-from survival_rl import HazardCritic, compute_first_dwell_time
+from survival_rl import HazardCritic, HazardCriticCompetitive, compute_first_dwell_time
 
 # mock actors
 
@@ -25,26 +25,39 @@ class CondActor(Module):
     def forward(self, state, cond):
         return self.mlp((state, cond))
 
+# helpers
+
+def get_log_survival(output):
+    return output.log_survival if isinstance(output, tuple) else output
+
 # test
 
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
 @param('reach_event_index, horizon_cutoff, shape', [
     (None, None, (2, 4)),
     (torch.tensor([0, 1]), None, ()),
     (torch.tensor([1, 2]), torch.tensor([3, 2]), ()),
 ])
-def test_critic(reach_event_index, horizon_cutoff, shape):
-    critic = HazardCritic(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4)
+def test_critic(critic_klass, reach_event_index, horizon_cutoff, shape):
+    critic = critic_klass(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4)
 
     state = torch.randn(2, 4)
     action = torch.randn(2, 7)
     event = torch.randn(2, 4)
 
-    assert critic(state, action, event, reach_event_index = reach_event_index, horizon_cutoff = horizon_cutoff).shape == shape
+    output = critic(state, action, event, reach_event_index = reach_event_index, horizon_cutoff = horizon_cutoff)
 
-def test_negative_reach_index_is_censored():
+    if isinstance(output, tuple):
+        assert output.logits.shape == (2, 5)
+        output = output.log_survival
+
+    assert output.shape == shape
+
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
+def test_negative_reach_index_is_censored(critic_klass):
     torch.manual_seed(0)
 
-    critic = HazardCritic(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4)
+    critic = critic_klass(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4)
 
     state = torch.randn(2, 4)
     action = torch.randn(2, 7)
@@ -60,10 +73,11 @@ def test_negative_reach_index_is_censored():
 
     assert torch.allclose(loss, censored)
 
-def test_e2e():
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
+def test_e2e(critic_klass):
     torch.manual_seed(0)
 
-    critic = HazardCritic(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4, discount_factor = 0.9)
+    critic = critic_klass(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4, discount_factor = 0.9)
     optim = torch.optim.Adam(critic.parameters(), lr = 1e-2)
 
     state = torch.randn(2, 4)
@@ -83,15 +97,69 @@ def test_e2e():
 
     assert torch.allclose(values, expected, atol = 1e-2)
 
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
+def test_time_bins_are_normalized(critic_klass):
+    torch.manual_seed(0)
+
+    num_time_bins = 4
+
+    critic = critic_klass(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = num_time_bins)
+
+    state = torch.randn(2, 4)
+    action = torch.randn(2, 7)
+    event = torch.randn(2, 4)
+
+    survival = get_log_survival(critic(state, action, event)).exp()
+
+    # bucket probabilities are survival differences, with the final bucket carrying the remaining mass
+
+    probs = torch.cat((1. - survival[..., :1], survival[..., :-1] - survival[..., 1:], survival[..., -1:]), dim = -1)
+
+    assert (probs >= -1e-6).all()
+    assert torch.allclose(probs.sum(dim = -1), torch.ones(2), atol = 1e-5)
+
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
+def test_censored_loss_is_tail_cross_entropy(critic_klass):
+    torch.manual_seed(0)
+
+    num_time_bins = 4
+
+    critic = critic_klass(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = num_time_bins)
+
+    state = torch.randn(2, 4)
+    action = torch.randn(2, 7)
+    event = torch.randn(2, 4)
+
+    survival = get_log_survival(critic(state, action, event)).exp()
+    probs = torch.cat((1. - survival[..., :1], survival[..., :-1] - survival[..., 1:], survival[..., -1:]), dim = -1)
+
+    # censoring at an arbitrary cutoff is the cross entropy against all remaining buckets
+
+    cutoff = torch.tensor([2, 3])
+    loss = critic(state, action, event, reach_event_index = torch.tensor([-1, -1]), horizon_cutoff = cutoff)
+
+    tail = torch.stack((probs[0, 2:].sum(), probs[1, 3:].sum()))
+    expected = -tail.log().mean()
+
+    assert torch.allclose(loss, expected, atol = 1e-5)
+
+    # censoring at the horizon reduces to the final bucket cross entropy
+
+    loss = critic(state, action, event, reach_event_index = torch.tensor([-1, -1]))
+    expected = -probs[:, num_time_bins].log().mean()
+
+    assert torch.allclose(loss, expected, atol = 1e-5)
+
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
 @param('actor_event_kwarg, actor_klass', [
     ('event', Actor),
     ('cond', CondActor)
 ])
 @param('negate', (False, True))
-def test_actor_learning(actor_event_kwarg, actor_klass, negate):
+def test_actor_learning(critic_klass, actor_event_kwarg, actor_klass, negate):
     torch.manual_seed(0)
 
-    critic = HazardCritic(
+    critic = critic_klass(
         dim = 16,
         depth = 2,
         dim_state = 4,
