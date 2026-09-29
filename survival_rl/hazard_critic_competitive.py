@@ -1,9 +1,7 @@
 from __future__ import annotations
 from math import log
-from typing import NamedTuple
 
 import torch
-from torch import Tensor
 from torch.nn.functional import log_softmax
 from torch.nn import Module, Linear
 
@@ -15,6 +13,8 @@ from x_mlps_pytorch import (
     AttnResidualNormedMLP
 )
 
+from survival_rl.survival_rl import CriticOutput
+
 # helpers
 
 def exists(v):
@@ -22,10 +22,6 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
-
-class CriticOutput(NamedTuple):
-    logits: Tensor
-    log_survival: Tensor
 
 # classes
 

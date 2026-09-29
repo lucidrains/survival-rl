@@ -48,7 +48,8 @@ def test_critic(critic_klass, reach_event_index, horizon_cutoff, shape):
     output = critic(state, action, event, reach_event_index = reach_event_index, horizon_cutoff = horizon_cutoff)
 
     if isinstance(output, tuple):
-        assert output.logits.shape == (2, 5)
+        num_logits = 5 if critic_klass is HazardCriticCompetitive else 4
+        assert output.logits.shape == (2, num_logits)
         output = output.log_survival
 
     assert output.shape == shape

@@ -1,5 +1,6 @@
 from survival_rl.survival_rl import (
     HazardCritic,
+    CriticOutput,
     compute_first_dwell_time
 )
 

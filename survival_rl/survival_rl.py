@@ -1,7 +1,9 @@
 from __future__ import annotations
 from math import log
+from typing import NamedTuple
 
 import torch
+from torch import Tensor
 from torch.nn.functional import (
     logsigmoid,
     binary_cross_entropy_with_logits
@@ -102,6 +104,12 @@ def compute_first_dwell_time(
 
     return reach_index, cutoff
 
+# outputs
+
+class CriticOutput(NamedTuple):
+    logits: Tensor
+    log_survival: Tensor
+
 # classes
 
 class HazardCritic(Module):
@@ -197,10 +205,10 @@ class HazardCritic(Module):
         if return_values:
             return -(log_survival + self.log_discounts).exp().sum(dim = -1)
 
-        # if no reach event index given, return the log survival function
+        # if no reach event index given, return the raw logits alongside the log survival function
 
         if not exists(reach_event_index):
-            return log_survival
+            return CriticOutput(time_bin_logits, log_survival)
 
         # bce loss on logits
 
