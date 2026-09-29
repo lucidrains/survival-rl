@@ -9,10 +9,13 @@ from torch.nn.functional import (
 from torch.nn import Module, Linear
 
 import einx
+from einops import rearrange
 
 from torch_einops_utils import (
     lens_to_mask,
-    masked_sum
+    masked_sum,
+    pad_left_at_dim,
+    pad_right_ndim_to
 )
 
 from x_mlps_pytorch import (
@@ -28,6 +31,76 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+# first time the trajectory dwells at the goal
+
+def compute_first_dwell_time(
+    goal,               # (..., num_queries, dim)
+    states = None,      # (..., num_steps + 1, dim) - states the actions were taken from
+    next_states = None, # (..., num_steps, dim) - post-action states (s_1, s_2, ...)
+    eps = 0.25,
+    dwell_steps = 1,    # int or tensor of dwell steps
+    lens = None         # int or tensor of trajectory lengths
+):
+    """
+    computes the first index the trajectory dwells at the goal
+    one of states or next_states must be given
+
+    returns the reach index (-1 if never reached) and the cutoff, both (..., num_queries)
+    """
+    assert exists(states) or exists(next_states), 'either states or next_states must be given'
+
+    if not exists(next_states):
+        next_states = states[..., 1:, :]
+
+    device = goal.device
+    num_queries, num_steps = goal.shape[-2], next_states.shape[-2]
+
+    # whether each post-action state lies within eps of each goal
+
+    inside = einx.subtract('... q d, ... t d -> ... q t d', goal, next_states).norm(dim = -1) <= eps
+
+    # dwell steps and lengths as tensor padded to match dimensions
+
+    lens = default(lens, num_steps)
+    lens = torch.as_tensor(lens, device = device)
+    lens = pad_right_ndim_to(lens, inside.ndim - 1)
+    padded_lens = pad_right_ndim_to(lens, inside.ndim)
+
+    k = torch.as_tensor(dwell_steps, device = device)
+    k = pad_right_ndim_to(k, inside.ndim - 1)
+    padded_k = pad_right_ndim_to(k, inside.ndim)
+
+    # mask out post-action states past sequence length
+
+    u = torch.arange(num_steps, device = device)
+    times = torch.arange(num_queries, device = device)
+
+    inside = inside & (u < padded_lens)
+
+    # cumulative sum for sliding window count of in-goal states
+
+    counts = pad_left_at_dim(inside.int().cumsum(dim = -1), 1)
+
+    valid_window = (u + padded_k) <= padded_lens
+    end_idx = (u + padded_k).clamp(max = num_steps).expand_as(inside)
+
+    sum_window = counts.gather(-1, end_idx) - counts[..., :-1]
+    dwell = valid_window & (sum_window == padded_k)
+
+    # first dwell window starting at or after each transition
+
+    candidate = dwell & (u >= rearrange(times, 'q -> q 1'))
+
+    reached = candidate.any(dim = -1)
+    first_start = candidate.long().argmax(dim = -1)
+
+    reach_index = torch.where(reached, first_start - times, -1)
+
+    cutoff = lens - k + 1 - times
+    cutoff = cutoff.clamp(min = 0).expand_as(reach_index)
+
+    return reach_index, cutoff
 
 # classes
 

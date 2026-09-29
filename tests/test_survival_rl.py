@@ -5,7 +5,7 @@ import torch
 from torch.nn import Module
 
 from x_mlps_pytorch import MLP
-from survival_rl import HazardCritic
+from survival_rl import HazardCritic, compute_first_dwell_time
 
 # mock actors
 
@@ -118,3 +118,59 @@ def test_actor_learning(actor_event_kwarg, actor_klass, negate):
     after = critic.extract_policy(actor, state, event, negate = negate).mean().item()
 
     assert after > before
+
+def test_compute_first_dwell_time():
+    goal = torch.tensor([[[1., 0.]]])
+    next_states = torch.tensor([[[0., 0.], [1., 0.], [1., 0.], [0., 0.]]])
+
+    reach, cutoff = compute_first_dwell_time(goal, next_states = next_states, eps = 0.5)
+    assert reach.item() == 1
+    assert cutoff.item() == 4
+
+    # the same result when given the full states including the first
+
+    states = torch.cat((torch.zeros(1, 1, 2), next_states), dim = 1)
+    reach_states, cutoff_states = compute_first_dwell_time(goal, states = states, eps = 0.5)
+    assert torch.equal(reach, reach_states)
+    assert torch.equal(cutoff, cutoff_states)
+
+    reach, cutoff = compute_first_dwell_time(goal, next_states = next_states, eps = 0.5, dwell_steps = 2)
+    assert reach.item() == 1
+    assert cutoff.item() == 3
+
+    # batched multi-query
+
+    goals = torch.tensor([1., 0.]).expand(2, 4, 2)
+
+    next_states = torch.tensor([
+        [[0., 0.], [1., 0.], [0., 0.], [1., 0.], [1., 0.], [1., 0.]],
+        [[0., 0.], [0., 0.], [0., 0.], [0., 0.], [0., 0.], [0., 0.]]
+    ])
+
+    reach, cutoff = compute_first_dwell_time(goals, next_states = next_states, eps = 0.5, dwell_steps = 2)
+
+    assert reach[0].tolist() == [3, 2, 1, 0]
+    assert reach[1].tolist() == [-1, -1, -1, -1]
+    assert cutoff.tolist() == [[5, 4, 3, 2], [5, 4, 3, 2]]
+
+    # differing dwell steps per batch element
+
+    reach, cutoff = compute_first_dwell_time(goals, next_states = next_states, eps = 0.5, dwell_steps = torch.tensor([1, 2]))
+
+    assert reach[0].tolist() == [1, 0, 1, 0]
+    assert reach[1].tolist() == [-1, -1, -1, -1]
+    assert cutoff.tolist() == [[6, 5, 4, 3], [5, 4, 3, 2]]
+
+    # variable lengths per batch element
+
+    reach, cutoff = compute_first_dwell_time(
+        goals,
+        next_states = next_states,
+        eps = 0.5,
+        dwell_steps = 2,
+        lens = torch.tensor([4, 6])
+    )
+
+    assert reach[0].tolist() == [-1, -1, -1, -1]
+    assert reach[1].tolist() == [-1, -1, -1, -1]
+    assert cutoff.tolist() == [[3, 2, 1, 0], [5, 4, 3, 2]]

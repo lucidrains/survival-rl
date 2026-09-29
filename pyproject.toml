@@ -1,6 +1,6 @@
 [project]
 name = "survival-rl"
-version = "0.0.2"
+version = "0.0.3"
 description = "Explorations into Survival Reinforcement Learning"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

@@ -1,7 +1,4 @@
 from survival_rl.survival_rl import (
-    HazardCritic
+    HazardCritic,
+    compute_first_dwell_time
 )
-
-__all__ = [
-    'HazardCritic'
-]
