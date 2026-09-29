@@ -4,6 +4,7 @@
 # dependencies = [
 #     "einx>=0.4.3",
 #     "einops>=0.8.2",
+#     "env-ssl-wrapper>=0.4.7",
 #     "fire",
 #     "gymnasium",
 #     "mean-conc-beta",
@@ -27,6 +28,7 @@ import gymnasium as gym
 import einx
 from einops import rearrange
 
+from env_ssl_wrapper import ActionChunkWrapper
 from mean_conc_beta import Beta
 from memmap_replay_buffer import ReplayBuffer
 from survival_rl import HazardCritic, HazardCriticCompetitive, compute_first_dwell_time
@@ -47,15 +49,16 @@ def schedule_value(schedule, step):
 # actor
 
 class Actor(nn.Module):
-    def __init__(self, dim_state = 3, dim_goal = GOAL_DIM, dim_hidden = 128):
+    def __init__(self, dim_state = 3, dim_goal = GOAL_DIM, dim_hidden = 128, chunk_len = 1):
         super().__init__()
         self.dim_goal = dim_goal
-        self.net = MLP(dim_state + dim_goal, dim_hidden, dim_hidden, 2, activation = nn.SiLU())
+        self.chunk_len = chunk_len
+        self.net = MLP(dim_state + dim_goal, dim_hidden, dim_hidden, 2 * chunk_len, activation = nn.SiLU())
         self.beta = Beta(bounds = (-1., 1.), init_conc = 10., detach_entropy_mean = False)
 
     def dist(self, state, goal):
         x = torch.cat((state, goal[..., :self.dim_goal]), dim = -1)
-        return self.beta(self.net(x).view(*x.shape[:-1], 1, 2))
+        return self.beta(self.net(x).view(*x.shape[:-1], self.chunk_len, 2))
 
     def forward(self, state, event):
         return self.dist(state, event).rsample()
@@ -66,7 +69,7 @@ class Actor(nn.Module):
 # evaluation
 
 @torch.no_grad()
-def evaluate(actor, env, step, horizon, num_episodes = 10):
+def evaluate(actor, env, step, horizon, chunk_len = 1, num_episodes = 10):
     device = next(actor.parameters()).device
     goal = GOAL.to(device)[None]
     scores = []
@@ -75,13 +78,13 @@ def evaluate(actor, env, step, horizon, num_episodes = 10):
         obs, _ = env.reset()
         score = 0.
 
-        for _ in range(horizon):
-            state = torch.from_numpy(obs).float().to(device)[None]
-            action = actor.dist(state, goal).mean[0]
-            obs, reward, terminated, truncated, _ = step(action.cpu().numpy())
-            score += reward
+        for _ in range(horizon // chunk_len):
+            state = torch.from_numpy(np.asarray(obs)).float().to(device)[None]
+            action = actor.dist(state, goal).mean[0].view(chunk_len, 1)
+            obs, reward, terminated, truncated, info = step(action)
+            score += float(np.sum(info['chunk_rewards']))
 
-            if terminated or truncated:
+            if bool(terminated) or bool(truncated):
                 break
 
         scores.append(score)
@@ -114,24 +117,31 @@ def main(
     p_future = 0.35,
     p_random = 0.15,
     collect_base_prob = 0.5,
-    competitive = False
+    competitive = False,
+    chunk_len = 1
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    max_dwell = dwell_schedule[-1][1]
 
-    actor = Actor().to(device)
+    # action chunks temporally compress the environment - dwell and discount must follow
+
+    chunk_horizon = horizon // chunk_len
+    chunk_dwell_schedule = tuple((until, max(1, round(dwell / chunk_len))) for until, dwell in dwell_schedule)
+    max_dwell = chunk_dwell_schedule[-1][1]
+    gamma_chunk = gamma ** chunk_len
+
+    actor = Actor(chunk_len = chunk_len).to(device)
     critic_klass = HazardCriticCompetitive if competitive else HazardCritic
     critic = critic_klass(
         dim = 128,
         depth = 2,
         dim_state = 3,
-        num_actions = 1,
-        pred_time_bins = horizon,
+        num_actions = chunk_len,
+        pred_time_bins = chunk_horizon,
         dim_event = GOAL_DIM + 1,
-        discount_factor = gamma
+        discount_factor = gamma_chunk
     ).to(device)
 
     actor_optim = AdamW(actor.parameters(), lr = lr_actor)
@@ -144,17 +154,20 @@ def main(
     buffer = ReplayBuffer(
         temp_dir.name,
         max_episodes = 256,
-        max_timesteps = horizon,
-        fields = dict(obs = ('float', 3), action = ('float', 1)),
+        max_timesteps = chunk_horizon,
+        fields = dict(obs = ('float', 3), action = ('float', chunk_len)),
         circular = True,
         overwrite = True
     )
 
-    envs = [gym.make('Pendulum-v1') for _ in range(num_envs)]
-    eval_env = gym.make('Pendulum-v1')
+    envs = [ActionChunkWrapper(gym.make('Pendulum-v1'), chunk_len = chunk_len, reward_mode = 'chunk') for _ in range(num_envs)]
+    eval_env = ActionChunkWrapper(gym.make('Pendulum-v1'), chunk_len = chunk_len, reward_mode = 'chunk')
 
-    step_fns = [actor.beta.rescale_env_step(e.step, target_range = (-2., 2.), clip = True) for e in envs]
-    eval_step = actor.beta.rescale_env_step(eval_env.step, target_range = (-2., 2.), clip = True)
+    # actions from the actor live in (-1, 1), the raw pendulum takes (-2, 2)
+
+    def env_step(env, action):
+        action = (action.reshape(chunk_len, 1) * 2.).clamp(-2., 2.)
+        return env.step(action.cpu().numpy()[None])
 
     base_goal = GOAL.to(device)
 
@@ -163,7 +176,7 @@ def main(
     def project(obs):
         velocity = obs[..., 2:]
         acceleration = torch.zeros_like(velocity)
-        acceleration[:, :-1] = (velocity[:, 1:] - velocity[:, :-1]) / dt
+        acceleration[:, :-1] = (velocity[:, 1:] - velocity[:, :-1]) / (dt * chunk_len)
         acceleration[:, -1] = acceleration[:, -2]
 
         return torch.cat((obs[..., :2], velocity / vel_scale, acceleration / acc_scale), dim = -1)
@@ -177,7 +190,7 @@ def main(
         states = project(obs)
 
         time_delta = times[None, :] - times[:, None]
-        weights = (gamma ** time_delta.clamp(min = 0.)).masked_fill(time_delta < 1, 0.)
+        weights = (gamma_chunk ** time_delta.clamp(min = 0.)).masked_fill(time_delta < 1, 0.)
         weights = weights + (weights.sum(-1, keepdim = True) <= 0.) / timesteps
         future_idx = torch.multinomial(weights, 1)[:, 0].clamp(max = timesteps - 1)
 
@@ -198,7 +211,7 @@ def main(
 
         return (
             rearrange(obs[:, :valid], 'b t d -> (b t) d'),
-            rearrange(action[:, :valid], 'b t d -> (b t) d'),
+            rearrange(action[:, :valid], 'b t k -> (b t) k'),
             rearrange(event, 'b t d -> (b t) d'),
             reach_index.reshape(-1),
             cutoff.reshape(-1)
@@ -207,7 +220,7 @@ def main(
     # collect - half of the environments chase the upright equilibrium, the rest chase a random angle
 
     def collect(epsilon, warmup = False):
-        obs = np.stack([e.reset()[0] for e in envs])
+        obs = np.stack([np.asarray(e.reset()[0]) for e in envs])
 
         is_base = np.random.rand(num_envs) < collect_base_prob
         angles = np.random.uniform(-pi, pi, num_envs)
@@ -219,18 +232,18 @@ def main(
         goals = torch.tensor(goals, dtype = torch.float32, device = device)
 
         with buffer.batched_episode(batch_size = num_envs):
-            for _ in range(horizon):
+            for _ in range(chunk_horizon):
                 if warmup:
-                    actions = torch.empty(num_envs, 1, device = device).uniform_(-1., 1.)
+                    actions = torch.empty(num_envs, chunk_len, device = device).uniform_(-1., 1.)
                 else:
                     actions = actor.dist(torch.from_numpy(obs).float().to(device), goals).sample()
                     is_random = torch.rand(num_envs, 1, device = device) < epsilon
                     actions = torch.where(is_random, torch.empty_like(actions).uniform_(-1., 1.), actions)
 
-                buffer.store_batch(obs = torch.from_numpy(obs), action = actions.cpu())
+                buffer.store_batch(obs = torch.from_numpy(obs.copy()), action = actions.cpu())
 
-                for i, step_fn in enumerate(step_fns):
-                    obs[i] = step_fn(actions[i].cpu().numpy())[0]
+                for i, env in enumerate(envs):
+                    obs[i] = np.asarray(env_step(env, actions[i])[0])
 
     # update - maximum likelihood hazard critic, then a sac actor maximizing the survival value
 
@@ -264,12 +277,15 @@ def main(
 
         return critic_loss.item(), values.mean().item()
 
-    score = evaluate(actor, eval_env, eval_step, horizon)
+    def eval_step(action):
+        return env_step(eval_env, action)
+
+    score = evaluate(actor, eval_env, eval_step, horizon, chunk_len = chunk_len)
 
     for iteration in range(1, iterations + 1):
-        dwell = schedule_value(dwell_schedule, iteration)
+        dwell = schedule_value(chunk_dwell_schedule, iteration)
         epsilon = schedule_value(epsilon_schedule, iteration)
-        target_entropy = schedule_value(entropy_schedule, iteration)
+        target_entropy = schedule_value(entropy_schedule, iteration) * chunk_len
 
         collect(epsilon, warmup = iteration <= warmup)
 
@@ -277,8 +293,8 @@ def main(
         losses = [update(batch.obs, batch.action, dwell, target_entropy) for _, batch in zip(range(grad_steps), loader)]
 
         if iteration % eval_every == 0 or iteration == iterations:
-            score = evaluate(actor, eval_env, eval_step, horizon)
-            print(f'iteration {iteration:4d} | dwell {dwell:2d} | critic loss {np.mean([l[0] for l in losses]):.4f} | value {np.mean([l[1] for l in losses]):.2f} | eval return {score:.1f}', flush = True)
+            score = evaluate(actor, eval_env, eval_step, horizon, chunk_len = chunk_len)
+            print(f'iteration {iteration:4d} | chunk {chunk_len:2d} | dwell {dwell:2d} | critic loss {np.mean([l[0] for l in losses]):.4f} | value {np.mean([l[1] for l in losses]):.2f} | eval return {score:.1f}', flush = True)
 
             if score >= target_return:
                 break
