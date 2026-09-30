@@ -2,8 +2,6 @@
 # /// script
 # requires-python = ">= 3.10"
 # dependencies = [
-#     "einx>=0.4.3",
-#     "einops>=0.8.2",
 #     "env-ssl-wrapper>=0.5.0",
 #     "fire",
 #     "gymnasium[box2d]",
@@ -12,9 +10,7 @@
 #     "mean-conc-beta",
 #     "memmap-replay-buffer",
 #     "numpy",
-#     "torch>=2.5",
-#     "torch-einops-utils>=0.1.31",
-#     "x-mlps-pytorch>=0.6.4",
+#     "survival-rl",
 # ]
 # ///
 

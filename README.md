@@ -1,6 +1,8 @@
+<img src="./alg1.png" width="350px"></img>
+
 ## Survival RL (wip)
 
-Explorations into an application of survival analysis to RL, proposed by Tiofack et al. earlier this year
+Explorations into an application of [survival analysis to RL](https://arxiv.org/abs/2605.31273), proposed by Tiofack et al. earlier this year
 
 ## Install
 
