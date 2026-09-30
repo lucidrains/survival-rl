@@ -109,6 +109,7 @@ def main(
     eps = 0.35, gamma = 0.99,
     lr_actor = 3e-4, lr_critic = 1e-3,
     p_base = 0.40, p_trajectory = 0.40, p_random = 0.10, collect_base_prob = 0.8,
+    bad_prob = 0.0, bad_weight = 0.0, bad_pool_size = 512, bad_reward_threshold = -10.,
     num_eval_episodes = 10,
     dwell_schedule = ((60, 1), (150, 2), (350, 3), (700, 4), (1100, 6), (1600, 8), (2300, 10), (3500, 12)),
     epsilon_schedule = ((100, 0.25), (400, 0.1), (1500, 0.05), (3500, 0.02)),
@@ -140,7 +141,20 @@ def main(
         discount_factor = gamma_chunk
     ).to(device)
 
+    # separate hazard critic over undesirable goal states - terminal states of crashes
+
+    critic_bad = HazardCriticCompetitive(
+        dim = dim_hidden,
+        depth = depth,
+        dim_state = dim_state,
+        num_actions = dim_action * chunk_len,
+        pred_time_bins = chunk_horizon,
+        dim_event = dim_goal + 1,
+        discount_factor = gamma_chunk
+    ).to(device) if bad_weight > 0. else None
+
     actor_optim, critic_optim = AdamW(actor.parameters(), lr = lr_actor), AdamW(critic.parameters(), lr = lr_critic)
+    bad_optim = AdamW(critic_bad.parameters(), lr = lr_critic) if exists(critic_bad) else None
 
     log_alpha = nn.Parameter(torch.tensor(log(init_alpha), device = device))
     alpha_optim = AdamW([log_alpha], lr = lr_actor)
@@ -150,7 +164,7 @@ def main(
         temp_dir.name,
         max_episodes = replay_buffer_size,
         max_timesteps = chunk_horizon,
-        fields = dict(obs = ('float', dim_state), action = ('float', dim_action * chunk_len), next_obs = ('float', dim_state)),
+        fields = dict(obs = ('float', dim_state), action = ('float', dim_action * chunk_len), next_obs = ('float', dim_state), failed = ('float', 1)),
         circular = True,
         overwrite = True
     )
@@ -160,6 +174,7 @@ def main(
 
     base_goal = torch.zeros(dim_goal, device = device)
     state_pool = StatePool(dim = dim_goal, max_size = state_pool_size, device = device)
+    bad_pool = StatePool(dim = dim_goal, max_size = bad_pool_size, device = device)
     stats = dict()
 
     # evaluation
@@ -206,6 +221,11 @@ def main(
                 next_o, reward, terminated, truncated, info = envs[i].step(act[None])
                 chunk_r = float(np.sum(info.get('chunk_rewards', [reward])))
 
+                # record undesirable goal states - large negative reward states, and crash terminals for the separate critic
+
+                if bad_prob > 0. and chunk_r < bad_reward_threshold:
+                    bad_pool.add(next_o)
+
                 t['obs'].append(batch[j])
                 t['action'].append(rearrange(act, 'c d -> (c d)'))
                 t['next_obs'].append(np.asarray(next_o, dtype = np.float32))
@@ -213,7 +233,18 @@ def main(
                 obs[i] = next_o
 
                 if terminated or truncated or len(t['obs']) >= chunk_horizon:
-                    buffer.store_episode(obs = np.stack(t['obs']), action = np.stack(t['action']), next_obs = np.stack(t['next_obs']))
+                    is_failed = bool(terminated and t['score'] <= landed_score_threshold)
+
+                    buffer.store_episode(
+                        obs = np.stack(t['obs']),
+                        action = np.stack(t['action']),
+                        next_obs = np.stack(t['next_obs']),
+                        failed = np.full((len(t['obs']),), float(is_failed), dtype = np.float32)
+                    )
+
+                    if is_failed and exists(critic_bad):
+                        bad_pool.add(next_o)
+
                     landed += int(terminated and t['score'] > landed_score_threshold)
                     lengths.append(len(t['obs']))
                     scores.append(t['score'])
@@ -251,11 +282,24 @@ def main(
         is_trajectory = (coin >= p_base) & (coin < p_base + p_trajectory)
         is_random = (coin >= p_base + p_trajectory) & (coin < p_base + p_trajectory + p_random)
 
+        # mix in undesirable goal states - recorded states that gave rise to a large negative reward
+
+        has_bad = bad_prob > 0. and bad_pool.size > 0
+        is_bad = (torch.rand(batch, timesteps, device = device) < bad_prob) if has_bad else torch.zeros(batch, timesteps, dtype = torch.bool, device = device)
+
+        is_base = is_base & ~is_bad
+        is_trajectory = is_trajectory & ~is_bad
+        is_random = is_random & ~is_bad
+
         is_base_mask, is_traj_mask, is_rand_mask = (rearrange(c, 'b t -> b t 1') for c in (is_base, is_trajectory, is_random))
 
         goal = torch.where(is_base_mask, base_goal,
                torch.where(is_traj_mask, trajectory_goal,
                torch.where(is_rand_mask, random_goal, positions)))
+
+        if has_bad:
+            bad_goal = bad_pool.sample(batch * timesteps).view(batch, timesteps, dim_goal)
+            goal = torch.where(rearrange(is_bad, 'b t -> b t 1'), bad_goal, goal)
 
         dwell_steps = torch.where(is_base, dwell, trajectory_dwell)
 
@@ -265,23 +309,54 @@ def main(
         reached = reach_index >= 0
         stats['event_rate'] = (reached & valid).float().sum().item() / valid.sum().clamp(min = 1).item()
         stats['hit_time'] = reach_index[reached & valid].float().mean().item() if (reached & valid).any() else -1.
+        stats['bad_frac'] = is_bad[valid].float().mean().item()
 
         dwell_feature = torch.where(is_base_mask, dwell / k_max, trajectory_dwell / k_max)
         event = torch.cat((goal, dwell_feature), dim = -1)
 
-        return tuple(t[valid] for t in (obs, action, event, reach_index, cutoff))
+        return tuple(t[valid] for t in (obs, action, event, reach_index, cutoff, is_bad))
+
+    # relabel undesirable goal states for the separate critic - crashed episodes query their own terminal state, everything else a sampled bad state
+
+    def relabel_bad(obs, next_obs, failed, lens):
+        batch, timesteps, _ = obs.shape
+        lens = lens.long()
+        times = torch.arange(timesteps, device = device)
+        failed_ep = failed.reshape(batch, timesteps, -1)[:, 0, 0] > 0.5
+
+        last = (lens - 1).clamp(min = 0)
+        terminal = einx.get_at('b [t] d, b -> b d', next_obs[..., :dim_goal], last)
+        sampled = bad_pool.sample(batch * timesteps).view(batch, timesteps, dim_goal)
+        bad_goal = torch.where(failed_ep[:, None, None], terminal[:, None].expand(-1, timesteps, -1), sampled)
+
+        remaining = (lens - 1)[:, None] - times
+        bad_reach = torch.where(failed_ep[:, None], remaining, -torch.ones_like(remaining))
+        bad_cutoff = lens[:, None] - times
+
+        bad_event = torch.cat((bad_goal, torch.zeros(batch, timesteps, 1, device = device)), dim = -1)
+
+        valid = lens_to_mask(lens, timesteps)
+        return tuple(t[valid] for t in (bad_event, bad_reach, bad_cutoff))
 
     # update
 
-    def update(obs, action, next_obs, lens, dwell, target_entropy):
-        obs, action, next_obs, lens = tree_map_tensor_to_device((obs, action, next_obs, lens), device)
-        states, actions, events, reach_index, cutoff = relabel(obs, action, next_obs, lens, dwell)
+    def update(obs, action, next_obs, failed, lens, dwell, target_entropy):
+        obs, action, next_obs, failed, lens = tree_map_tensor_to_device((obs, action, next_obs, failed, lens), device)
+        states, actions, events, reach_index, cutoff, is_bad = relabel(obs, action, next_obs, lens, dwell)
 
         critic_loss = critic(states, actions, events, reach_event_index = reach_index, horizon_cutoff = cutoff)
         critic_loss.backward()
         nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
         critic_optim.step()
         critic_optim.zero_grad()
+
+        if exists(critic_bad):
+            bad_events, bad_reach, bad_cutoff = relabel_bad(obs, next_obs, failed, lens)
+            bad_loss = critic_bad(states, actions, bad_events, reach_event_index = bad_reach, horizon_cutoff = bad_cutoff)
+            bad_loss.backward()
+            nn.utils.clip_grad_norm_(critic_bad.parameters(), max_grad_norm)
+            bad_optim.step()
+            bad_optim.zero_grad()
 
         dist = actor.dist(states, events)
         actions_flat = rearrange(dist.rsample(), 'b ... -> b (...)')
@@ -290,8 +365,24 @@ def main(
 
         alpha = log_alpha.exp()
 
-        actor_loss = (-alpha.detach() * entropy - values).mean()
+        # maximize the time-to-goal value, minimize the time-to-bad-value by flipping its sign
+
+        value_sign = torch.where(is_bad, 1., -1.)
+        actor_loss = (value_sign * values - alpha.detach() * entropy).mean()
+
+        if exists(critic_bad):
+            bad_values = critic_bad(states, actions_flat, bad_events, return_values = True)
+            actor_loss = actor_loss + bad_weight * bad_values.mean()
+            stats['v_bad'] = bad_values.mean().item()
+
         actor_loss.backward()
+
+        # clear critic grads induced by the actor loss, else the next critic step applies them
+
+        critic_optim.zero_grad()
+        if exists(critic_bad):
+            bad_optim.zero_grad()
+
         nn.utils.clip_grad_norm_(actor.parameters(), max_grad_norm)
         actor_optim.step()
         actor_optim.zero_grad()
@@ -313,12 +404,16 @@ def main(
     video_dir.mkdir(parents = True, exist_ok = True)
 
     def save_checkpoint(path):
-        torch.save(dict(actor = actor.state_dict(), critic = critic.state_dict(), log_alpha = log_alpha, iteration = iteration, best_score = best_score), path)
+        torch.save(dict(actor = actor.state_dict(), critic = critic.state_dict(), critic_bad = critic_bad.state_dict() if exists(critic_bad) else None, log_alpha = log_alpha, iteration = iteration, best_score = best_score), path)
 
     if resume and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location = device)
         actor.load_state_dict(ckpt['actor'])
         critic.load_state_dict(ckpt['critic'])
+
+        if exists(critic_bad) and exists(ckpt.get('critic_bad')):
+            critic_bad.load_state_dict(ckpt['critic_bad'])
+
         log_alpha.data.copy_(ckpt['log_alpha'].data)
         start_iteration, best_score = ckpt.get('iteration', 0) + 1, ckpt.get('best_score', -float('inf'))
         print(f'resumed from {checkpoint_file} at {start_iteration} (best: {best_score:.1f})')
@@ -333,8 +428,8 @@ def main(
 
         collect(epsilon, warmup = iteration <= warmup)
 
-        loader = buffer.dataloader(batch_size = batch_episodes, to_named_tuple = ('obs', 'action', 'next_obs', '_lens'), shuffle = True)
-        losses = [update(batch.obs, batch.action, batch.next_obs, batch.lens, dwell, target_entropy) for _, batch in zip(range(grad_steps), loader)]
+        loader = buffer.dataloader(batch_size = batch_episodes, to_named_tuple = ('obs', 'action', 'next_obs', 'failed', '_lens'), shuffle = True)
+        losses = [update(batch.obs, batch.action, batch.next_obs, batch.failed, batch.lens, dwell, target_entropy) for _, batch in zip(range(grad_steps), loader)]
 
         if divisible_by(iteration, eval_every) or iteration == iterations:
             save_video = record_video and (divisible_by(iteration, video_every) or iteration == iterations)
@@ -342,7 +437,7 @@ def main(
             score = evaluate(video_path = video_path)
 
             critic_loss, mean_val = np.mean(losses, axis = 0)
-            print(f'iteration {iteration:4d} | dwell {dwell:2d} | achieved {stats["achieved"]:.1f} | critic {critic_loss:.4f} | val {mean_val:.2f} | alpha {stats["alpha"]:.3f} | ent {stats["entropy"]:.2f} | coll ret {stats["collect_return"]:.1f} | len {stats["collect_len"]:.0f} | landed {stats["landed"]:2d} | ev {stats["event_rate"]:.3f} | hit {stats["hit_time"]:.1f} | eval return {score:.1f}', flush = True)
+            print(f'iteration {iteration:4d} | dwell {dwell:2d} | achieved {stats["achieved"]:.1f} | critic {critic_loss:.4f} | val {mean_val:.2f} | alpha {stats["alpha"]:.3f} | ent {stats["entropy"]:.2f} | bad {stats.get("bad_frac", 0.):.2f} | vb {stats.get("v_bad", 0.):6.1f} | coll ret {stats["collect_return"]:.1f} | len {stats["collect_len"]:.0f} | landed {stats["landed"]:2d} | ev {stats["event_rate"]:.3f} | hit {stats["hit_time"]:.1f} | eval return {score:.1f}', flush = True)
 
             if score > best_score:
                 best_score = score
