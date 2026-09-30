@@ -4,7 +4,7 @@
 # dependencies = [
 #     "einx>=0.4.3",
 #     "einops>=0.8.2",
-#     "env-ssl-wrapper>=0.4.7",
+#     "env-ssl-wrapper>=0.5.0",
 #     "fire",
 #     "gymnasium",
 #     "mean-conc-beta",
@@ -28,7 +28,7 @@ import gymnasium as gym
 import einx
 from einops import rearrange
 
-from env_ssl_wrapper import ActionChunkWrapper
+from env_ssl_wrapper import ActionChunkWrapper, evaluate_actor
 from mean_conc_beta import Beta
 from memmap_replay_buffer import ReplayBuffer
 from survival_rl import HazardCritic, HazardCriticCompetitive, compute_first_dwell_time
@@ -65,31 +65,6 @@ class Actor(nn.Module):
 
     def entropy(self, state, event):
         return self.dist(state, event).entropy().sum(dim = -1)
-
-# evaluation
-
-@torch.no_grad()
-def evaluate(actor, env, step, horizon, chunk_len = 1, num_episodes = 10):
-    device = next(actor.parameters()).device
-    goal = GOAL.to(device)[None]
-    scores = []
-
-    for _ in range(num_episodes):
-        obs, _ = env.reset()
-        score = 0.
-
-        for _ in range(horizon // chunk_len):
-            state = torch.from_numpy(np.asarray(obs)).float().to(device)[None]
-            action = actor.dist(state, goal).mean[0].view(chunk_len, 1)
-            obs, reward, terminated, truncated, info = step(action)
-            score += float(np.sum(info['chunk_rewards']))
-
-            if bool(terminated) or bool(truncated):
-                break
-
-        scores.append(score)
-
-    return float(np.mean(scores))
 
 # main
 
@@ -277,10 +252,25 @@ def main(
 
         return critic_loss.item(), values.mean().item()
 
-    def eval_step(action):
-        return env_step(eval_env, action)
+    # evaluation - fixed seeds so checkpoints are compared on identical episodes
 
-    score = evaluate(actor, eval_env, eval_step, horizon, chunk_len = chunk_len)
+    def eval_policy(state, goal):
+        return (actor.dist(state, goal).mean * 2.).clamp(-2., 2.)
+
+    def evaluate():
+        stats = evaluate_actor(
+            eval_policy,
+            eval_env,
+            episodes = 10,
+            max_steps = horizon // chunk_len,
+            seed = seed,
+            goal = GOAL.to(device),
+            device = device
+        )
+
+        return stats.mean
+
+    score = evaluate()
 
     for iteration in range(1, iterations + 1):
         dwell = schedule_value(chunk_dwell_schedule, iteration)
@@ -293,7 +283,7 @@ def main(
         losses = [update(batch.obs, batch.action, dwell, target_entropy) for _, batch in zip(range(grad_steps), loader)]
 
         if iteration % eval_every == 0 or iteration == iterations:
-            score = evaluate(actor, eval_env, eval_step, horizon, chunk_len = chunk_len)
+            score = evaluate()
             print(f'iteration {iteration:4d} | chunk {chunk_len:2d} | dwell {dwell:2d} | critic loss {np.mean([l[0] for l in losses]):.4f} | value {np.mean([l[1] for l in losses]):.2f} | eval return {score:.1f}', flush = True)
 
             if score >= target_return:
