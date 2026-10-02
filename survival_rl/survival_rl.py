@@ -8,7 +8,7 @@ from torch.nn.functional import (
     logsigmoid,
     binary_cross_entropy_with_logits
 )
-from torch.nn import Module, Linear
+from torch.nn import Module, Linear, SiLU
 
 import einx
 from einops import rearrange
@@ -123,6 +123,7 @@ class HazardCritic(Module):
         pred_time_bins,
         dim_action = None,
         dim_event = None,
+        encode_event = True,
         actor_event_kwarg = 'event',
         attn_residual = True,
         discount_factor = 0.99
@@ -138,12 +139,17 @@ class HazardCritic(Module):
 
         self.action_encoder = MLP(num_actions, dim_action, dim_action)
 
+        # encode event / goal before film, rather than a linear projection
+
+        event_encoder = MLP(dim_event, dim, dim, activation = SiLU()) if encode_event else None
+
         mlp_kwargs = dict(
             dim_in = dim_state + dim_action,
             dim = dim,
             depth = depth,
             film = True,
-            cond_dim = dim_event
+            cond_dim = dim if encode_event else dim_event,
+            cond_encoder = event_encoder
         )
 
         if not attn_residual:

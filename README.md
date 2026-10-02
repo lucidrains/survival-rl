@@ -1,6 +1,6 @@
 <img src="./alg1.png" width="350px"></img>
 
-## Survival RL (wip)
+## Survival RL
 
 Explorations into an application of [survival analysis to RL](https://arxiv.org/abs/2605.31273), proposed by Tiofack et al. of Inria earlier this year
 
