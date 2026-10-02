@@ -192,7 +192,7 @@ def main(
     def collect(epsilon, warmup = False):
         obs = [env.reset()[0] for env in envs]
 
-        random_goals = np.random.uniform(-1., 1., (num_envs, GOAL_DIM)).astype(np.float32) * state_scale.cpu().numpy()
+        random_goals = np.random.uniform(-1., 1., (num_envs, GOAL_DIM)).astype(np.float32)
         is_base = np.random.rand(num_envs) < collect_base_prob
         goals = torch.tensor(np.where(is_base[:, None], 0., random_goals), dtype = torch.float32, device = device)
 
