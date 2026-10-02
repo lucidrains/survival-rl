@@ -123,7 +123,9 @@ class HazardCritic(Module):
         pred_time_bins,
         dim_action = None,
         dim_event = None,
+        dim_event_encoded = None,
         encode_event = True,
+        event_encoder = None,
         actor_event_kwarg = 'event',
         attn_residual = True,
         discount_factor = 0.99
@@ -141,14 +143,17 @@ class HazardCritic(Module):
 
         # encode event / goal before film, rather than a linear projection
 
-        event_encoder = MLP(dim_event, dim, dim, activation = SiLU()) if encode_event else None
+        if exists(event_encoder):
+            encode_event = True
+        elif encode_event:
+            event_encoder = MLP(dim_event, dim, dim, activation = SiLU())
 
         mlp_kwargs = dict(
             dim_in = dim_state + dim_action,
             dim = dim,
             depth = depth,
             film = True,
-            cond_dim = dim if encode_event else dim_event,
+            cond_dim = default(dim_event_encoded, dim if encode_event else dim_event),
             cond_encoder = event_encoder
         )
 

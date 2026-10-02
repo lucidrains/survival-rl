@@ -2,7 +2,7 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
-from torch.nn import Module
+from torch.nn import Module, Linear
 
 from x_mlps_pytorch import MLP
 from survival_rl import HazardCritic, HazardCriticCompetitive, compute_first_dwell_time
@@ -53,6 +53,41 @@ def test_critic(critic_klass, reach_event_index, horizon_cutoff, shape):
         output = output.log_survival
 
     assert output.shape == shape
+
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
+@param('encode_event', (True, False))
+def test_overridable_event_encoder(critic_klass, encode_event):
+    torch.manual_seed(0)
+
+    class CustomEventEncoder(Module):
+        def __init__(self, dim_event, dim_out):
+            super().__init__()
+            self.proj = Linear(dim_event, dim_out)
+
+        def forward(self, event):
+            return self.proj(event).relu()
+
+    critic = critic_klass(
+        dim = 16,
+        depth = 2,
+        dim_state = 4,
+        num_actions = 7,
+        pred_time_bins = 4,
+        dim_event = 6,
+        dim_event_encoded = 8,
+        encode_event = encode_event,
+        event_encoder = CustomEventEncoder(6, 8)
+    )
+
+    assert isinstance(critic.mlp.cond_encoder, CustomEventEncoder)
+
+    state = torch.randn(2, 4)
+    action = torch.randn(2, 7)
+    event = torch.randn(2, 6)
+
+    output = critic(state, action, event)
+
+    assert output.log_survival.shape == (2, 4)
 
 @param('critic_klass', (HazardCritic, HazardCriticCompetitive))
 def test_negative_reach_index_is_censored(critic_klass):
