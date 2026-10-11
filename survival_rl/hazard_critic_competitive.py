@@ -13,7 +13,7 @@ from x_mlps_pytorch import (
     AttnResidualNormedMLP
 )
 
-from survival_rl.survival_rl import CriticOutput
+from survival_rl.survival_rl import CriticOutput, shift_event_probs
 
 # helpers
 
@@ -106,7 +106,11 @@ class HazardCriticCompetitive(Module):
         event,
         reach_event_index = None, # -1 or >= horizon_cutoff treated as right-censored
         horizon_cutoff = None,
-        return_values = False
+        return_values = False,
+        bootstrap_state = None,   # state at t + steps, for censored transitions
+        bootstrap_action = None,  # action taken at t + steps
+        bootstrap_steps = None,   # certified failed dwell windows, 0 falls back to the censor tail
+        bootstrap_critic = None   # target critic for the shifted event pmf, defaults to self
     ):
         horizon_cutoff = default(horizon_cutoff, self.num_time_bins)
         batch, device = state.shape[0], state.device
@@ -151,4 +155,18 @@ class HazardCriticCompetitive(Module):
         censored_loss = -batched_index_select(log_tail, tail_bin)
 
         reached_event = (reach_event_index >= 0) & (reach_event_index < horizon_cutoff)
+
+        # optional bellman bootstrap on censored transitions
+
+        if exists(bootstrap_steps):
+            assert exists(bootstrap_state) and exists(bootstrap_action)
+
+            with torch.no_grad():
+                target_critic = default(bootstrap_critic, self)
+                target_logits = target_critic(bootstrap_state, bootstrap_action, event).logits
+                target_event_probs = shift_event_probs(target_logits.softmax(dim = -1), bootstrap_steps)
+
+            boot_loss = -(target_event_probs * log_probs).sum(dim = -1)
+            censored_loss = torch.where(bootstrap_steps > 0, boot_loss, censored_loss)
+
         return torch.where(reached_event, hit_loss, censored_loss).mean()

@@ -134,6 +134,41 @@ def test_e2e(critic_klass):
     assert torch.allclose(values, expected, atol = 1e-2)
 
 @param('critic_klass', (HazardCritic, HazardCriticCompetitive))
+def test_bootstrap_e2e(critic_klass):
+    torch.manual_seed(0)
+
+    critic = critic_klass(dim = 16, depth = 2, dim_state = 4, num_actions = 7, pred_time_bins = 4, discount_factor = 0.9)
+    optim = torch.optim.Adam(critic.parameters(), lr = 1e-2)
+
+    state = torch.randn(3, 4)
+    action = torch.randn(3, 7)
+    event = torch.randn(1, 4).repeat(3, 1)
+
+    reach_event_index = torch.tensor([1, 2, -1])
+
+    # the censored row is only supervised by row 0's prediction shifted by one bin,
+    # so it should converge to an event time of 2 (value 1.9)
+
+    for _ in range(600):
+        optim.zero_grad()
+        loss = critic(
+            state,
+            action,
+            event,
+            reach_event_index = reach_event_index,
+            bootstrap_state = state[:1].expand(3, -1),
+            bootstrap_action = action[:1].expand(3, -1),
+            bootstrap_steps = torch.tensor([0, 0, 1])
+        )
+        loss.backward()
+        optim.step()
+
+    values = critic(state, action, event, return_values = True)
+    expected = -torch.tensor([1.0, 1.9, 1.9])
+
+    assert torch.allclose(values, expected, atol = 1e-2)
+
+@param('critic_klass', (HazardCritic, HazardCriticCompetitive))
 def test_time_bins_are_normalized(critic_klass):
     torch.manual_seed(0)
 

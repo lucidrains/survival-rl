@@ -17,7 +17,10 @@ from torch_einops_utils import (
     lens_to_mask,
     masked_sum,
     pad_left_at_dim,
-    pad_right_ndim_to
+    pad_right_ndim_to,
+    exclusive_cumsum,
+    reverse_cumsum,
+    safe_cat
 )
 
 from x_mlps_pytorch import (
@@ -33,6 +36,37 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+# bellman bootstrap on censored transitions
+
+# per bin hazards (b h) -> event pmf (b h + 1), tail bucket holds the mass past the horizon
+
+def hazard_logits_to_event_probs(logits):
+    log_hazard, log_survival = logsigmoid(logits), logsigmoid(-logits)
+    event_probs = (log_hazard + exclusive_cumsum(log_survival, dim = -1)).exp()
+    tail = log_survival.sum(dim = -1, keepdim = True).exp()
+    return safe_cat((event_probs, tail), dim = -1)
+
+# nll of the per bin hazards against a soft event pmf, one bin per logit
+
+def soft_target_nll(logits, target_probs):
+    event_target = target_probs[..., :-1]
+    survival_target = reverse_cumsum(target_probs, dim = -1)[..., 1:]
+    return -(event_target * logsigmoid(logits) + survival_target * logsigmoid(-logits)).sum(dim = -1)
+
+# shift event times right by steps, folding the overflow past the horizon into the tail bucket
+
+def shift_event_probs(probs, steps):
+    num_bins = probs.shape[-1] - 1
+
+    steps = torch.as_tensor(steps, device = probs.device)
+    indices = einx.add('h, ... -> ... h', torch.arange(num_bins, device = probs.device), -steps)
+
+    event_probs = probs[..., :num_bins]
+    shifted = event_probs.gather(-1, indices.clamp(min = 0)).masked_fill(indices < 0, 0.)
+
+    overflow = (event_probs.sum(dim = -1) - shifted.sum(dim = -1)).clamp(min = 0.)
+    return safe_cat((shifted, probs[..., -1:] + overflow[..., None]), dim = -1)
 
 # first time the trajectory dwells at the goal
 
@@ -193,7 +227,11 @@ class HazardCritic(Module):
         event,
         reach_event_index = None, # -1 or >= horizon_cutoff treated as right-censored
         horizon_cutoff = None,
-        return_values = False
+        return_values = False,
+        bootstrap_state = None,   # state at t + steps, for censored transitions
+        bootstrap_action = None,  # action taken at t + steps
+        bootstrap_steps = None,   # certified failed dwell windows, 0 falls back to the censor tail
+        bootstrap_critic = None   # target critic for the shifted event pmf, defaults to self
     ):
         horizon_cutoff = default(horizon_cutoff, self.num_time_bins)
 
@@ -233,4 +271,21 @@ class HazardCritic(Module):
         lens = torch.where(reach_event_index >= 0, reach_event_index + 1, horizon_cutoff).clamp(max = horizon_cutoff)
         mask = lens_to_mask(lens, self.num_time_bins)
 
-        return masked_sum(losses, mask, dim = -1).mean()
+        loss = masked_sum(losses, mask, dim = -1)
+
+        # optional bellman bootstrap on censored transitions
+
+        if exists(bootstrap_steps):
+            assert exists(bootstrap_state) and exists(bootstrap_action)
+
+            with torch.no_grad():
+                target_critic = default(bootstrap_critic, self)
+                target_logits = target_critic(bootstrap_state, bootstrap_action, event).logits
+                target_event_probs = shift_event_probs(hazard_logits_to_event_probs(target_logits), bootstrap_steps)
+
+            observed = (reach_event_index >= 0) & (reach_event_index < horizon_cutoff)
+            use_bootstrap = ~observed & (bootstrap_steps > 0)
+
+            loss = torch.where(use_bootstrap, soft_target_nll(time_bin_logits, target_event_probs), loss)
+
+        return loss.mean()
